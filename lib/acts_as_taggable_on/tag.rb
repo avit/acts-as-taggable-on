@@ -52,32 +52,29 @@ module ActsAsTaggableOn
     ### CLASS METHODS:
 
     def self.find_or_create_with_like_by_name(name)
-      if (ActsAsTaggableOn.strict_case_match)
-        self.find_or_create_all_with_like_by_name([name]).first
+      if ActsAsTaggableOn.strict_case_match
+        find_or_create_all_with_like_by_name([name]).first
       else
         named_like(name).first || create(:name => name)
       end
     end
 
     def self.find_or_create_all_with_like_by_name(*list)
-      list = [list].flatten
+      list = Array(list).flatten
+      return list if list.empty?
 
-      return [] if list.empty?
-
-      existing_tags = Tag.named_any(list)
+      existing_tags = named_any(list)
 
       list.map do |tag_name|
-        comparable_tag_name = comparable_name(tag_name)
-        existing_tag = existing_tags.find { |tag| comparable_name(tag.name) == comparable_tag_name }
-
-        existing_tag || Tag.create(:name => tag_name)
+        existing_tag = existing_tags.find { |tag| comparable_name(tag.name) == comparable_name(tag_name) }
+        existing_tag or create(name: tag_name)
       end
     end
 
     ### INSTANCE METHODS:
 
     def ==(object)
-      super || (object.is_a?(Tag) && name == object.name)
+      super or object.is_a?(Tag) && name == object.name
     end
 
     def to_s

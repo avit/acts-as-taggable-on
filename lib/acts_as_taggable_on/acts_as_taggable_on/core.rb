@@ -216,7 +216,10 @@ module ActsAsTaggableOn::Taggable
       end
 
       def add_custom_context(value)
-        custom_contexts << value.to_s unless custom_contexts.include?(value.to_s) or self.class.tag_types.map(&:to_s).include?(value.to_s)
+        context = value.to_s
+        unless custom_contexts.include?(context) or self.class.tag_types.map(&:to_s).include?(context)
+          custom_contexts << context
+        end
       end
 
       def cached_tag_list_on(context)
@@ -230,13 +233,15 @@ module ActsAsTaggableOn::Taggable
 
       def tag_list_cache_on(context)
         variable_name = "@#{context.to_s.singularize}_list"
-        if instance_variable_get(variable_name)
-          instance_variable_get(variable_name)
-        elsif cached_tag_list_on(context) && self.class.caching_tag_list_on?(context)
-          instance_variable_set(variable_name, ActsAsTaggableOn::TagList.from(cached_tag_list_on(context)))
+        cached = instance_variable_get(variable_name)
+        return cached if cached
+        missed_cache = cached_tag_list_on(context)
+        if missed_cache && self.class.caching_tag_list_on?(context)
+          tag_names = missed_cache
         else
-          instance_variable_set(variable_name, ActsAsTaggableOn::TagList.new(tags_on(context).map(&:name)))
+          tag_names = tags_on(context).map(&:name)
         end
+        instance_variable_set(variable_name, ActsAsTaggableOn::TagList.from(tag_names))
       end
 
       def tag_list_on(context)
@@ -300,7 +305,6 @@ module ActsAsTaggableOn::Taggable
         attrib = "#{context.to_s.singularize}_list"
 
         if changed_attributes.include?(attrib)
-          # The attribute already has an unsaved change.
           old = changed_attributes[attrib]
           changed_attributes.delete(attrib) if (old.to_s == value.to_s)
         else
@@ -311,26 +315,23 @@ module ActsAsTaggableOn::Taggable
 
       def reload(*args)
         self.class.tag_types.each do |context|
-          instance_variable_set("@#{context.to_s.singularize}_list", nil)
-          instance_variable_set("@all_#{context.to_s.singularize}_list", nil)
+          ctx = context.to_s.singularize
+          instance_variable_set("@#{ctx}_list", nil)
+          instance_variable_set("@all_#{ctx}_list", nil)
         end
 
-        super(*args)
+        super
       end
 
       def save_tags
         tagging_contexts.each do |context|
           next unless tag_list_cache_set_on(context)
-          # List of currently assigned tag names
           tag_list = tag_list_cache_on(context).uniq
 
-          # Find existing tags or create non-existing tags:
           tags = ActsAsTaggableOn::Tag.find_or_create_all_with_like_by_name(tag_list)
 
-          # Tag objects for currently assigned tags
           current_tags = tags_on(context)
 
-          # Tag maintenance based on whether preserving the created order of tags
           if self.class.preserve_tag_order?
             old_tags, new_tags = current_tags - tags, tags - current_tags
 
@@ -344,24 +345,23 @@ module ActsAsTaggableOn::Taggable
               new_tags |= current_tags[index...current_tags.size] & shared_tags
 
               # Order the array of tag objects to match the tag list
-              new_tags = tags.map do |t| 
+              new_tags = tags.map do |t|
                 new_tags.find { |n| n.name.downcase == t.name.downcase }
               end.compact
             end
           else
-            # Delete discarded tags and create new tags
             old_tags = current_tags - tags
             new_tags = tags - current_tags
           end
 
-          # Find taggings to remove:
           if old_tags.present?
             old_taggings = taggings.where(:tagger_type => nil, :tagger_id => nil, :context => context.to_s, :tag_id => old_tags)
           end
 
           # Destroy old taggings:
           if old_taggings.present?
-            ActsAsTaggableOn::Tagging.destroy_all "#{ActsAsTaggableOn::Tagging.primary_key}".to_sym => old_taggings.map(&:id)
+            tagging_key = "#{ActsAsTaggableOn::Tagging.primary_key}".to_sym
+            ActsAsTaggableOn::Tagging.destroy_all tagging_key => old_taggings.map(&:id)
           end
 
           # Create new taggings:

@@ -15,6 +15,7 @@ module ActsAsTaggableOn
     #   tag_list = TagList.from("One , Two,  Three")
     #   tag_list # ["One", "Two", "Three"]
     def self.from(string)
+      return string if self === string
       string = string.join(ActsAsTaggableOn.glue) if string.respond_to?(:join)
 
       new.tap do |tag_list|
@@ -22,7 +23,7 @@ module ActsAsTaggableOn
 
         # Parse the quoted tags
         d = ActsAsTaggableOn.delimiter
-        d = d.join("|") if d.kind_of?(Array) 
+        d = d.join("|") if d.kind_of?(Array)
         string.gsub!(/(\A|#{d})\s*"(.*?)"\s*(#{d}\s*|\z)/) { tag_list << $2; $3 }
         string.gsub!(/(\A|#{d})\s*'(.*?)'\s*(#{d}\s*|\z)/) { tag_list << $2; $3 }
 

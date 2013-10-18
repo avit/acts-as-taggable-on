@@ -35,11 +35,11 @@ module ActsAsTaggableOn::Taggable
       end
 
       def tag_counts_on(context, options = {})
-        all_tag_counts(options.merge({:on => context.to_s}))
+        all_tag_counts(options.merge(:on => context.to_s))
       end
 
       def tags_on(context, options = {})
-        all_tags(options.merge({:on => context.to_s}))
+        all_tags(options.merge(:on => context.to_s))
       end
 
       ##
