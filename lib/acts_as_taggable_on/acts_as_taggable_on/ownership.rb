@@ -30,21 +30,19 @@ module ActsAsTaggableOn::Taggable
     
     module InstanceMethods
       def owner_tags_on(owner, context)
-        if owner.nil?
-          scope = base_tags.where([%(#{ActsAsTaggableOn::Tagging.table_name}.context = ?), context.to_s])                    
-        else
-          scope = base_tags.where([%(#{ActsAsTaggableOn::Tagging.table_name}.context = ? AND
-                                     #{ActsAsTaggableOn::Tagging.table_name}.tagger_id = ? AND
-                                     #{ActsAsTaggableOn::Tagging.table_name}.tagger_type = ?), context.to_s, owner.id, owner.class.base_class.to_s])          
+        tagging_table = taggings.arel_table
+        for_context   = tagging_table[:context].eq(context)
+
+        if owner
+          for_owner   = tagging_table[:tagger_id].eq(owner.id)
+                   .and tagging_table[:tagger_type].eq(owner.class.base_class.name)
         end
 
-        # when preserving tag order, return tags in created order
-        # if we added the order to the association this would always apply
-        if self.class.preserve_tag_order?
-          scope.order("#{ActsAsTaggableOn::Tagging.table_name}.id")
-        else 
-          scope
-        end
+        tag_conditions = [for_context, for_owner].compact.reduce(&:and)
+
+        tags_scope = base_tags.where(tag_conditions)
+        tags_scope = tags_scope.order(tagging_table[:id]) if self.class.preserve_tag_order?
+        tags_scope
       end
 
       def cached_owned_tag_list_on(context)

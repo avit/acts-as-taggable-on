@@ -65,6 +65,95 @@ module ActsAsTaggableOn::Taggable
         object.column_names.map { |column| "#{object.table_name}.#{column}" }.join(", ")
       end
 
+      def arel_taggings_table(options = {})
+        tagging      = ActsAsTaggableOn::Tagging
+        context_name = options[:context].to_s.underscore.pluralize if options[:context]
+        alias_parts  = [context_name, tagging.table_name, base_class.table_name, "join", options[:for]]
+        Arel::Table.new(tagging.table_name, engine: tagging, as: alias_parts.compact.join(?_))
+      end
+
+      def arel_tags_table(options = {})
+        tag          = ActsAsTaggableOn::Tag
+        context_name = [options[:context].to_s.underscore, "tags"].compact.uniq.join(?_) if options[:context]
+        Arel::Table.new(tag.table_name, engine: tag, as: context_name)
+      end
+
+      def joins_taggings(tags, options)
+        context = options[:on]
+        owner   = options[:owned_by]
+        exclude = options[:exclude]
+
+        tag_ids = tags.map(&:id)
+        tag_ids = [tag_ids] if options[:any]
+
+        matching_tags = tag_ids.map do |tag_id|
+          tagging_table   = arel_taggings_table(context: context, for: tag_id)
+
+          for_tag         = tagging_table[:tag_id].public_send(exclude ? :not_in : :in, tag_id)
+
+          for_context     = tagging_table[:context].eq(context) if context
+
+          for_taggable    = tagging_table[:taggable_id].eq(arel_table[primary_key])
+                       .and tagging_table[:taggable_type].eq(base_class.name)
+                       # TODO: if current model is STI descendant, add type checking to the join condition
+                       # << " AND #{table_name}.#{inheritance_column} = '#{name}'" unless descends_from_active_record?
+
+          for_owner       = tagging_table[:tagger_id].eq(owner.id)
+                       .and tagging_table[:tagger_type].eq(owner.class.base_class.name) if owner
+
+          tag_conditions  = [for_taggable, for_tag, for_context, for_owner].compact.reduce(&:and)
+
+          arel_table.join(tagging_table).on(tag_conditions).join_sources
+        end
+
+        matching_tags.reduce(self, &:joins)
+      end
+
+      def without_taggings(tags, options={})
+        owner = options[:owned_by]
+
+        tag_ids = tags.map(&:id)
+
+        tagging_table = arel_taggings_table
+        tag_table     = arel_tags_table
+
+        tag_key = tagging_table[:tag_id].eq(tag_table[:id])
+
+        excluded_taggable_ids = tagging_table
+            .project(tagging_table[:taggable_id])
+            .where(tagging_table[:taggable_type].eq(base_class.name))
+            .where(tagging_table[:tag_id].in(tag_ids))
+
+        where(arel_table[primary_key].not_in(excluded_taggable_ids))
+      end
+
+      def having_all_tags(tags, options={})
+        context = options[:on]
+        owner   = options[:owned_by]
+
+        tagging_table     = arel_taggings_table(context: context, for: "group_count")
+        taggable_id       = tagging_table[:taggable_id]
+        taggable_type     = tagging_table[:taggable_type]
+
+        tag_table         = arel_tags_table(context: context, for: "group_count")
+
+        group_key         = taggable_id.eq(arel_table[primary_key])
+                       .and taggable_type.eq(base_class.name)
+
+        same_size         = taggable_id.count.eq(tags.size)
+
+        matching_all_tags = arel_table.join(tagging_table, Arel::Nodes::OuterJoin)
+                              .on(group_key).join_sources
+
+        joins(matching_all_tags).group(arel_table[primary_key]).having(same_size)
+      end
+
+      unless respond_to?(:none) # Added in Rails 4
+        def self.none
+          where("1 = 0")
+        end
+      end
+
       ##
       # Return a scope of objects that are tagged with the specified tags.
       #
@@ -83,132 +172,20 @@ module ActsAsTaggableOn::Taggable
       #   User.tagged_with("awesome", "cool", :owned_by => foo ) # Users that are tagged with just awesome and cool by 'foo'
       def tagged_with(tags, options = {})
         tag_list = ActsAsTaggableOn::TagList.from(tags)
-        empty_result = where("1 = 0")
+        return none if tag_list.empty?
 
-        return empty_result if tag_list.empty?
+        tags = ActsAsTaggableOn::Tag.public_send(options[:wild] ? :named_like_any : :named_any, tag_list)
+        return none unless (tags.length == tag_list.length) || options[:any] || options[:wild]
 
-        joins = []
-        conditions = []
-        having = []
-        select_clause = []
+        scope = select(arel_table[Arel.star]).joins_taggings(tags, options)
+        scope = scope.without_taggings(tags, options) if options[:exclude]
+        scope = scope.having_all_tags(tags, options) if options[:match_all]
 
-        context = options.delete(:on)
-        owned_by = options.delete(:owned_by)
-        alias_base_name = undecorated_table_name.gsub('.','_')
-        quote = ActsAsTaggableOn::Tag.using_postgresql? ? '"' : ''
-
-        if options.delete(:exclude)
-          if options.delete(:wild)
-            tags_conditions = tag_list.map { |t| sanitize_sql(["#{ActsAsTaggableOn::Tag.table_name}.name #{like_operator} ? ESCAPE '!'", "%#{escape_like(t)}%"]) }.join(" OR ")
-          else
-            tags_conditions = tag_list.map { |t| sanitize_sql(["#{ActsAsTaggableOn::Tag.table_name}.name #{like_operator} ?", t]) }.join(" OR ")
-          end
-
-          conditions << "#{table_name}.#{primary_key} NOT IN (SELECT #{ActsAsTaggableOn::Tagging.table_name}.taggable_id FROM #{ActsAsTaggableOn::Tagging.table_name} JOIN #{ActsAsTaggableOn::Tag.table_name} ON #{ActsAsTaggableOn::Tagging.table_name}.tag_id = #{ActsAsTaggableOn::Tag.table_name}.#{ActsAsTaggableOn::Tag.primary_key} AND (#{tags_conditions}) WHERE #{ActsAsTaggableOn::Tagging.table_name}.taggable_type = #{quote_value(base_class.name)})"
-
-          if owned_by
-            joins <<  "JOIN #{ActsAsTaggableOn::Tagging.table_name}" +
-                      "  ON #{ActsAsTaggableOn::Tagging.table_name}.taggable_id = #{quote}#{table_name}#{quote}.#{primary_key}" +
-                      " AND #{ActsAsTaggableOn::Tagging.table_name}.taggable_type = #{quote_value(base_class.name)}" +
-                      " AND #{ActsAsTaggableOn::Tagging.table_name}.tagger_id = #{owned_by.id}" +
-                      " AND #{ActsAsTaggableOn::Tagging.table_name}.tagger_type = #{quote_value(owned_by.class.base_class.to_s)}"
-          end
-
-        elsif options.delete(:any)
-          # get tags, drop out if nothing returned (we need at least one)
-          tags = if options.delete(:wild)
-            ActsAsTaggableOn::Tag.named_like_any(tag_list)
-          else
-            ActsAsTaggableOn::Tag.named_any(tag_list)
-          end
-
-          return empty_result unless tags.length > 0
-
-          # setup taggings alias so we can chain, ex: items_locations_taggings_awesome_cool_123
-          # avoid ambiguous column name
-          taggings_context = context ? "_#{context}" : ''
-
-          taggings_alias   = adjust_taggings_alias(
-            "#{alias_base_name[0..4]}#{taggings_context[0..6]}_taggings_#{sha_prefix(tags.map(&:name).join('_'))}"
-          )
-
-          tagging_join  = "JOIN #{ActsAsTaggableOn::Tagging.table_name} #{taggings_alias}" +
-                          "  ON #{taggings_alias}.taggable_id = #{quote}#{table_name}#{quote}.#{primary_key}" +
-                          " AND #{taggings_alias}.taggable_type = #{quote_value(base_class.name)}"
-          tagging_join << " AND " + sanitize_sql(["#{taggings_alias}.context = ?", context.to_s]) if context
-
-          # don't need to sanitize sql, map all ids and join with OR logic
-          conditions << tags.map { |t| "#{taggings_alias}.tag_id = #{t.id}" }.join(" OR ")
-          select_clause = "DISTINCT #{table_name}.*" unless context and tag_types.one?
-
-          if owned_by
-              tagging_join << " AND " +
-                  sanitize_sql([
-                      "#{taggings_alias}.tagger_id = ? AND #{taggings_alias}.tagger_type = ?",
-                      owned_by.id,
-                      owned_by.class.base_class.to_s
-                  ])
-          end
-
-          joins << tagging_join
-        else
-          tags = ActsAsTaggableOn::Tag.named_any(tag_list)
-
-          return empty_result unless tags.length == tag_list.length
-
-          tags.each do |tag|
-            taggings_alias = adjust_taggings_alias("#{alias_base_name[0..11]}_taggings_#{sha_prefix(tag.name)}")
-            tagging_join  = "JOIN #{ActsAsTaggableOn::Tagging.table_name} #{taggings_alias}" +
-                            "  ON #{taggings_alias}.taggable_id = #{quote}#{table_name}#{quote}.#{primary_key}" +
-                            " AND #{taggings_alias}.taggable_type = #{quote_value(base_class.name)}" +
-                            " AND #{taggings_alias}.tag_id = #{tag.id}"
-
-            tagging_join << " AND " + sanitize_sql(["#{taggings_alias}.context = ?", context.to_s]) if context
-
-            if owned_by
-                tagging_join << " AND " +
-                  sanitize_sql([
-                    "#{taggings_alias}.tagger_id = ? AND #{taggings_alias}.tagger_type = ?",
-                    owned_by.id,
-                    owned_by.class.base_class.to_s
-                  ])
-            end
-
-            joins << tagging_join
-          end
-        end
-
-        taggings_alias, tags_alias = adjust_taggings_alias("#{alias_base_name}_taggings_group"), "#{alias_base_name}_tags_group"
-
-        if options.delete(:match_all)
-          joins << "LEFT OUTER JOIN #{ActsAsTaggableOn::Tagging.table_name} #{taggings_alias}" +
-                   "  ON #{taggings_alias}.taggable_id = #{quote}#{table_name}#{quote}.#{primary_key}" +
-                   " AND #{taggings_alias}.taggable_type = #{quote_value(base_class.name)}"
-
-
-          group_columns = ActsAsTaggableOn::Tag.using_postgresql? ? grouped_column_names_for(self) : "#{table_name}.#{primary_key}"
-          group = group_columns
-          having = "COUNT(#{taggings_alias}.taggable_id) = #{tags.size}"
-        end
-
-        select(select_clause) \
-          .joins(joins.join(" ")) \
-          .where(conditions.join(" AND ")) \
-          .group(group) \
-          .having(having) \
-          .order(options[:order]) \
-          .readonly(false)
+        scope.uniq(arel_table[:id]).order(options[:order]).readonly(false)
       end
 
       def is_taggable?
         true
-      end
-
-      def adjust_taggings_alias(taggings_alias)
-        if taggings_alias.size > 75
-          taggings_alias = 'taggings_alias_' + Digest::SHA1.hexdigest(taggings_alias)
-        end
-        taggings_alias
       end
 
       def taggable_mixin
@@ -217,6 +194,14 @@ module ActsAsTaggableOn::Taggable
     end
 
     module InstanceMethods
+      def arel_taggings_table(*args)
+        self.class.arel_taggings_table(*args)
+      end
+
+      def arel_tags_table(*args)
+        self.class.arel_tags_table(*args)
+      end
+
       # all column names are necessary for PostgreSQL group clause
       def grouped_column_names_for(object)
         self.class.grouped_column_names_for(object)
@@ -268,28 +253,32 @@ module ActsAsTaggableOn::Taggable
 
       ##
       # Returns all tags of a given context
+      # @WIP
       def all_tags_on(context)
-        tag_table_name = ActsAsTaggableOn::Tag.table_name
-        tagging_table_name = ActsAsTaggableOn::Tagging.table_name
+        tag_table     = base_tags.arel_table
+        tagging_table = taggings.arel_table
+        for_context   = tagging_table[:context].eq(context.to_s)
 
-        opts  =  ["#{tagging_table_name}.context = ?", context.to_s]
-        scope = base_tags.where(opts)
+        scope = base_tags.where(for_context)
 
-        if ActsAsTaggableOn::Tag.using_postgresql?
+        if ActsAsTaggableOn::Tag.using_postgresql? # FIXME
           group_columns = grouped_column_names_for(ActsAsTaggableOn::Tag)
-          scope.order("max(#{tagging_table_name}.created_at)").group(group_columns)
+          scope = scope.order(tagging_table[:created_at].max).group(group_columns)
         else
-          scope.group("#{ActsAsTaggableOn::Tag.table_name}.#{ActsAsTaggableOn::Tag.primary_key}")
-        end.to_a
+          scope = scope.group(tag_table[:id])
+        end
+        scope.to_a
       end
 
       ##
       # Returns all tags that are not owned of a given context
       def tags_on(context)
-        scope = base_tags.where(["#{ActsAsTaggableOn::Tagging.table_name}.context = ? AND #{ActsAsTaggableOn::Tagging.table_name}.tagger_id IS NULL", context.to_s])
-        # when preserving tag order, return tags in created order
-        # if we added the order to the association this would always apply
-        scope = scope.order("#{ActsAsTaggableOn::Tagging.table_name}.id") if self.class.preserve_tag_order?
+        tagging_table = ActsAsTaggableOn::Tagging.arel_table
+        for_context   = tagging_table[:context].eq(context.to_s)
+        no_tagger     = tagging_table[:tagger_id].eq(nil)
+
+        scope = base_tags.where(for_context.and(no_tagger))
+        scope = scope.order(tagging_table[:id]) if self.class.preserve_tag_order?
         scope
       end
 

@@ -38,11 +38,15 @@ module ActsAsTaggableOn
     end
 
     def self.named_like(name)
-      where(["name #{like_operator} ? ESCAPE '!'", "%#{escape_like(name)}%"])
+      where(escaped_name_attribute_matches(name))
     end
 
     def self.named_like_any(list)
-      where(list.map { |tag| sanitize_sql(["name #{like_operator} ? ESCAPE '!'", "%#{escape_like(tag.to_s)}%"]) }.join(" OR "))
+      where(Array(list).map { |name| escaped_name_attribute_matches(name) }.reduce(&:or))
+    end
+
+    def self.escaped_name_attribute_matches(name)
+      arel_table[:name].matches(Arel.sql(%{'%#{name.gsub('%','!%')}%' ESCAPE '!'}))
     end
 
     ### CLASS METHODS:

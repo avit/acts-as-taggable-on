@@ -330,6 +330,13 @@ describe "Taggable" do
     TaggableModel.tagged_with('rails').joins([:untaggable_models]).all_tags.should have(2).items
   end
 
+  it "does not interfere with different joins or scopes" do
+    alice = TaggableModel.create(:name => "Alice",  :tag_list => "ruby", :skill_list => "ruby")
+    bob   = TaggableModel.create(:name => "Bob",    :tag_list => "ruby")
+
+    TaggableModel.joins(:taggings => :tag).tagged_with('ruby').tagged_with('ruby', :on => :skills).should eq [alice]
+  end
+
   it "should be able to set a custom tag context list" do
     bob = TaggableModel.create(:name => "Bob")
     bob.set_tag_list_on(:rotors, "spinning, jumping")
